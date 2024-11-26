@@ -47,12 +47,12 @@
 __device__ void Sum(float* sdata, float* result, unsigned arraySize) {
     unsigned int tid = threadIdx.x;
     // do reduction in shared mem
-    for(unsigned int s=1; s < blockDim.x; s *= 2) {
-        if ((tid % (2*s) == 0) && (tid+s < arraySize)) {
+    for (unsigned int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
             sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
-    }    
+    }
     // write result for this block to global mem
     if (tid == 0) {
         //printf("writing block %d: %0.2f\n", blockIdx.x, sdata[0]);

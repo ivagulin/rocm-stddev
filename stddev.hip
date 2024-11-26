@@ -44,34 +44,28 @@
         }                                                                                   \
     }
 
-
-template<typename T>
-void SubNumber(T* __restrict x, T a, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        x[i] -= a;
+__device__ void Sum(float* sdata, float* result, unsigned arraySize) {
+    unsigned int tid = threadIdx.x;
+    // do reduction in shared mem
+    for(unsigned int s=1; s < blockDim.x; s *= 2) {
+        if ((tid % (2*s) == 0) && (tid+s < arraySize)) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }    
+    // write result for this block to global mem
+    if (tid == 0) {
+        //printf("writing block %d: %0.2f\n", blockIdx.x, sdata[0]);
+        result[blockIdx.x] = sdata[0];
     }
 }
 
-template<typename T>
-void Mul(T* __restrict x, T* __restrict y, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        x[i] *= y[i];
-    }
-}
+const int blockNum = 10; // * 1000;
+const int arraySize = 10;
 
-template<typename T>
-T Sum(T* __restrict x, size_t n) {
-    T sum = 0;
-    for (size_t i = 0; i < n; i++) {
-        sum += x[i];
-    }
-    return sum;
-}
-
-//__device__ void Sum()
-
-__global__ void computeStdDev(const float* g_idata, float* g_odata, int size) {
-    __shared__ float sdata[1024];
+__global__ void computeStdDev(const float* g_idata, float* g_odata) {
+    __shared__ float sdata[arraySize];
+    __shared__ float mean[blockNum];
     //__shared__ float sdata[1000];
     // float* sumBuf32 = localData;
     // float* mulBuf32 = localData+size;
@@ -80,55 +74,30 @@ __global__ void computeStdDev(const float* g_idata, float* g_odata, int size) {
     // each thread loads one element from global to shared mem
     unsigned int tid = threadIdx.x;
     unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
-    sdata[tid] = g_idata[i];
+    if (tid < arraySize)
+        sdata[tid] = g_idata[i];
     __syncthreads();
-    // do reduction in shared mem
-    for(unsigned int s=1; s < blockDim.x; s *= 2) {
-        if (tid % (2*s) == 0) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }    
-    // write result for this block to global mem
+    Sum(sdata, mean, arraySize);
+    if (tid == 0)
+        mean[blockIdx.x] = mean[blockIdx.x] / arraySize;
     __syncthreads();
-    if (tid == 0) {
-        //printf("writing block %d: %0.2f\n", blockIdx.x, sdata[0]);
-        g_odata[blockIdx.x] = sdata[0];
-    }
 
-    // unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
-    // if (threadIdx.x == 0) {
-    //     g_odata[blockIdx.x] = blockIdx.x;
+    // if (tid == 0){
+    //     g_odata[blockIdx.x] = mean[blockIdx.x];
     // }
 
-
-    // // write result for this block to global mem
-    // if (tid == 0) 
-    //     output[blockIdx.x] = sdata[0];
-
-    // float cpuMean = 0;
-    // cpuMean = Sum(data, size) / float(size);
-    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // if (idx < size) {
-    //     data[idx] *= 2.0f;
-    // }
-    // for (size_t i = 0; i < size; i++) {
-    //     x[i] -= a;
-    // }
-   
-
-    // float variance = 0;
     // std::copy(data, data+size, sumBuf32);
     // SubNumber(sumBuf32, cpuMean, size);
     // std::copy(sumBuf32, sumBuf32+size, mulBuf32);
     // Mul(mulBuf32, mulBuf32, size);
     // variance = Sum(mulBuf32, size);
-
+    sdata[tid] = g_idata[i] - mean[blockIdx.x];
+    sdata[tid] = sdata[tid] * sdata[tid];
+    __syncthreads();
+    Sum(sdata, g_odata, arraySize);
 }
 
 int main() {
-    const int blockNum = 10; // * 1000;
-    const int arraySize = 1024;
     float *h_input;
     float *h_output;
 
@@ -136,12 +105,17 @@ int main() {
     h_output = new float[blockNum];
 
     for(unsigned i=0; i<blockNum; i++){
-        //std::cout << "filling: " << i << std::endl;
-        std::fill(h_input + i*arraySize, h_input + i*arraySize  + arraySize, i%100);
+        std::cout << "filling: " << i << std::endl;
+        for(unsigned j=0; j<arraySize; j++){
+            auto r = double(rand()) / (RAND_MAX + 1.) * double(i%100);
+            h_input[i*arraySize+j] = r;
+        }
+        //std::fill(h_input + i*arraySize, h_input + i*arraySize  + arraySize, i%100);
     }
     for(unsigned i=0; i<blockNum; i++){
+        printf("block %d: ", i);
         for(unsigned j=0; j<arraySize; j++){
-            printf("%.2f ", h_input[i*arraySize+j]);
+            printf("%.2f,", h_input[i*arraySize+j]);
         }
         printf("\n");
     }
@@ -149,12 +123,12 @@ int main() {
     HIP_CHECK(hipMalloc(&d_input, blockNum * arraySize * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_output, blockNum * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_input, h_input, blockNum * arraySize * sizeof(float), hipMemcpyHostToDevice));
-    computeStdDev<<<dim3(blockNum), dim3(arraySize), arraySize*3*sizeof(float)>>>(d_input, d_output, arraySize);
+    computeStdDev<<<dim3(blockNum), dim3(arraySize), arraySize*3*sizeof(float)>>>(d_input, d_output);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipMemcpy(h_output, d_output, blockNum * sizeof(float), hipMemcpyDeviceToHost));
 
     for(unsigned i=0; i<blockNum; i++) {
-        printf("sum of %d: %0.2f\n", i, double(h_output[i]));
+        printf("stddev of %d: %0.2f\n", i, std::sqrt(h_output[i])/arraySize);
         //std::cout << "sum of " << i << ": " << h_output[i] << std::endl;
     }
 }

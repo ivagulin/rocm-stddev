@@ -44,24 +44,38 @@
         }                                                                                   \
     }
 
-__device__ void Sum(float* sdata, float* result, unsigned arraySize) {
-    unsigned int tid = threadIdx.x;
-    // do reduction in shared mem
-    for (unsigned int s=blockDim.x/2; s>0; s>>=1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-    // write result for this block to global mem
-    if (tid == 0) {
-        //printf("writing block %d: %0.2f\n", blockIdx.x, sdata[0]);
-        result[blockIdx.x] = sdata[0];
-    }
+
+__device__ float warpReduceSum(float val) {
+    for (int offset = warpSize/2; offset > 0; offset /= 2) 
+        val += __shfl_down(val, offset);
+    return val;
 }
 
-const int blockNum = 1000*1000; // * 1000;
-const int arraySize = 1000;
+
+__device__ void blockReduceSum(const float* sdata, float* g_odata) {
+    __shared__ float shared[32]; // Shared mem for 32 partial sums
+    unsigned lane = threadIdx.x % warpSize;
+    unsigned wid = threadIdx.x / warpSize;
+
+    float val = warpReduceSum(sdata[threadIdx.x]);     // Each warp performs partial reduction
+
+    if (lane==0) 
+        shared[wid]=val; // Write reduced value to shared memory
+
+    __syncthreads();              // Wait for all partial reductions
+
+    //read from shared memory only if that warp existed
+    val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0;
+
+    if (wid==0) 
+        val = warpReduceSum(val); //Final reduce within first warp
+
+    if (threadIdx.x == 0)
+        g_odata[blockIdx.x] = val;
+}
+
+const int blockNum = 1000*1000;
+const int arraySize = 1024;
 
 __global__ void computeStdDev(const float* g_idata, float* g_odata) {
     __shared__ float sdata[arraySize];
@@ -76,23 +90,12 @@ __global__ void computeStdDev(const float* g_idata, float* g_odata) {
     unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
     sdata[tid] = g_idata[i];
     __syncthreads();
-    Sum(sdata, g_odata, arraySize);
-    if (tid == 0)
-        g_odata[blockIdx.x] = g_odata[blockIdx.x] / arraySize;
+    blockReduceSum(sdata, g_odata);
     __syncthreads();
-
-    // if (tid == 0){
-    //     g_odata[blockIdx.x] = mean[blockIdx.x];
-    // }
-    // std::copy(data, data+size, sumBuf32);
-    // SubNumber(sumBuf32, cpuMean, size);
-    // std::copy(sumBuf32, sumBuf32+size, mulBuf32);
-    // Mul(mulBuf32, mulBuf32, size);
-    // variance = Sum(mulBuf32, size);
-    sdata[tid] = g_idata[i] - g_odata[blockIdx.x];
+    sdata[tid] = g_idata[i] - (g_odata[blockIdx.x] / arraySize);
     sdata[tid] = sdata[tid] * sdata[tid];
     __syncthreads();
-    Sum(sdata, g_odata, arraySize);
+    blockReduceSum(sdata, g_odata);
 }
 
 int main() {
@@ -104,7 +107,7 @@ int main() {
 
     //prepare data
     for(unsigned i=0; i<blockNum; i++){
-        //std::cout << "filling: " << i << std::endl;
+        // std::cout << "filling: " << i << std::endl;
         for(unsigned j=0; j<arraySize; j++){
             auto r = double(rand()) / (RAND_MAX + 1.) * double(i%100);
             h_input[i*arraySize+j] = r;
@@ -125,17 +128,19 @@ int main() {
     HIP_CHECK(hipMalloc(&d_input, blockNum * arraySize * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_output, blockNum * sizeof(float)));
     HIP_CHECK(hipMemcpy(d_input, h_input, blockNum * arraySize * sizeof(float), hipMemcpyHostToDevice));
-    auto start = std::chrono::high_resolution_clock::now();
-    computeStdDev<<<dim3(blockNum), dim3(arraySize), arraySize*3*sizeof(float)>>>(d_input, d_output);
-    HIP_CHECK(hipGetLastError());
-    HIP_CHECK(hipMemcpy(h_output, d_output, blockNum * sizeof(float), hipMemcpyDeviceToHost));
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
-    std::cout << "Время выполнения: " << duration.count() << " секунд" << std::endl;
+    for(unsigned i=0; i<10; i++){
+        auto start = std::chrono::high_resolution_clock::now();
+        computeStdDev<<<dim3(blockNum), dim3(arraySize), arraySize*3*sizeof(float)>>>(d_input, d_output);
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipMemcpy(h_output, d_output, blockNum * sizeof(float), hipMemcpyDeviceToHost));
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> duration = end - start;
+        std::cout << "Время выполнения: " << duration.count() << " секунд" << std::endl;
+    }
 
     // print results
-    // for(unsigned i=0; i<blockNum; i++) {
-    //     printf("stddev of %d: %0.2f\n", i, std::sqrt(h_output[i])/arraySize);
-    //     //std::cout << "sum of " << i << ": " << h_output[i] << std::endl;
-    // }
+    for(unsigned i=0; i<blockNum; i++) {
+        // printf("stddev of %d: %0.2f\n", i, std::sqrt(h_output[i])/arraySize);
+        // std::cout << "sum of " << i << ": " << h_output[i] << std::endl;
+    }
 }
